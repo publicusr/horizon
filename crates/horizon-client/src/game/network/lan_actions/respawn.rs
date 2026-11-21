@@ -452,11 +452,23 @@ impl Game<'_> {
                 kind: "minecraft:player",
                 player: Some(uuid),
                 // `dropAllDeathLoot(level, source)`: every death has a source, so
-                // the drops hear the blow `living_death` heard, `/kill`'s
-                // generic_kill and an unrecorded death's generic included.
-                source: blow.as_ref().map(|(damage_type, attacker)| {
-                    crate::game::creatures::death_hurt_source(damage_type, *attacker)
-                }),
+                // with mods loaded the drops hear the blow `living_death` heard,
+                // `/kill`'s generic_kill and an unrecorded death's generic
+                // included. Without mods `blow` is `None` and the combat record's
+                // blow stays, so `drop_death_items` keeps today's draw order.
+                source: blow
+                    .as_ref()
+                    .map(|(damage_type, attacker)| {
+                        crate::game::creatures::death_hurt_source(damage_type, *attacker)
+                    })
+                    .or_else(|| {
+                        killing.as_ref().map(|(damage_type, attacker)| {
+                            crate::game::creatures::death_hurt_source(
+                                damage_type,
+                                attacker.unwrap_or(0),
+                            )
+                        })
+                    }),
                 recently_hit,
             };
             // LivingEntity.die: the death is heard, and a sculk catalyst
