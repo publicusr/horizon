@@ -217,7 +217,8 @@ mod tests {
     }
 
     /// A server player's death is told at `ServerPlayer.die`'s tail too: after
-    /// its death message, the inventory drops and the experience.
+    /// its death message, the inventory drops and the experience. A death with
+    /// no recorded hit still has a source, so its drop list is heard too.
     #[test]
     #[ignore = "daily"]
     fn living_death_post_hears_a_player_death_after_the_message_and_loot() {
@@ -252,7 +253,7 @@ mod tests {
 
                 assert_eq!(
                     *heard.lock().unwrap(),
-                    ["death", "xp", "post"],
+                    ["death", "loot", "xp", "post"],
                     "the inventory drop, the message and the experience ran before it"
                 );
                 let post = post.lock().unwrap();

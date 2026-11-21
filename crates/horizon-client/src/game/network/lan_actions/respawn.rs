@@ -451,8 +451,11 @@ impl Game<'_> {
                 entity: id as u32,
                 kind: "minecraft:player",
                 player: Some(uuid),
-                source: killing.as_ref().map(|(damage_type, attacker)| {
-                    crate::game::creatures::death_hurt_source(damage_type, attacker.unwrap_or(0))
+                // `dropAllDeathLoot(level, source)`: every death has a source, so
+                // the drops hear the blow `living_death` heard, `/kill`'s
+                // generic_kill and an unrecorded death's generic included.
+                source: blow.as_ref().map(|(damage_type, attacker)| {
+                    crate::game::creatures::death_hurt_source(damage_type, *attacker)
                 }),
                 recently_hit,
             };
