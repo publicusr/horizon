@@ -1162,6 +1162,29 @@ fn a_call_under_its_cpu_budget_is_checked_again_by_its_wall_backstop() {
 }
 
 #[test]
+fn a_call_past_its_wall_backstop_stops_with_little_cpu_used() {
+    // A hook call (100 ms of CPU, so a 5 s backstop) that has waited 5 s while its thread used
+    // almost no CPU: the backstop stops it, and says it was wall time.
+    let Some(began) = Instant::now().checked_sub(Duration::from_secs(5)) else {
+        return; // The machine has been up for less than 5 s.
+    };
+    let mut state = State::new(Limits::new("a".into(), 64));
+    state.epoch_budget = 100;
+    state.cpu_clock = || Some(Duration::from_millis(1));
+    state.call_start = Some(CallStart {
+        thread: std::thread::current().id(),
+        cpu: Some(Duration::ZERO),
+        wall: began,
+    });
+    assert_eq!(state.budget_left(), None);
+    assert!(
+        matches!(state.overrun, Some(Overrun::Wall(wall)) if wall >= Duration::from_secs(5)),
+        "{:?}",
+        state.overrun
+    );
+}
+
+#[test]
 fn this_threads_cpu_clock_counts_its_own_work() {
     let Some(start) = thread_cpu_time() else {
         return; // A platform without a thread clock: the budget counts wall time.

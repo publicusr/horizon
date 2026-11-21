@@ -170,7 +170,8 @@ pub(crate) fn wall_backstop(budget: Duration) -> Duration {
 pub(crate) fn thread_cpu_time() -> Option<Duration> {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
-        let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        use rustix::time::{ClockId, DynamicClockId, clock_gettime_dynamic};
+        let t = clock_gettime_dynamic(DynamicClockId::Known(ClockId::ThreadCPUTime)).ok()?;
         Some(Duration::new(
             u64::try_from(t.tv_sec).ok()?,
             u32::try_from(t.tv_nsec).ok()?,
@@ -262,7 +263,7 @@ impl State {
         }
         // Whole ticks still left, at least one, so the next check comes after the next tick; never
         // past the backstop, since the ticks are the only check there is.
-        let left = (budget - used).min(backstop - wall);
+        let left = (budget - used).min(backstop.saturating_sub(wall));
         Some(u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1))
     }
 }
