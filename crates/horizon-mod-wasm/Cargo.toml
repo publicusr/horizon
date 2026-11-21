@@ -25,7 +25,10 @@ wasmtime = { version = "50", default-features = false, features = ["anyhow", "cr
 horizon-mod-api-gen = { path = "../horizon-mod-api-gen" }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 horizon-engine-slots = { path = "../horizon-engine-slots" }

@@ -1018,7 +1018,12 @@ fn nested_load_calls_do_not_extend_the_outer_deadline() {
         let module = module(&format!(
             "local.get 0 i32.const 1 i32.eq if (result i64) i64.const 0 else i32.const {id} i32.const 0 i32.const 0 i32.const 2048 i32.const 8 call $host drop i64.const 8796093022216 end"
         ));
-        let epoch = module.running.group.lock().unwrap().store.engine().clone();
+        let epoch = {
+            let mut group = module.running.group.lock().unwrap();
+            // No thread clock: the ticks counted here are the budget, as on a platform without one.
+            group.store.data_mut().cpu_clock = || None;
+            group.store.engine().clone()
+        };
         let entered = Cell::new(false);
         let mut random = Random(|| {
             entered.set(true);
@@ -1044,6 +1049,110 @@ fn nested_load_calls_do_not_extend_the_outer_deadline() {
         assert!(entered.get());
         assert!(module.is_stopped());
     })
+}
+
+/// A hook whose host call lets `ticks` epoch ticks pass (wall time, as when the system leaves the
+/// thread waiting) while the thread's CPU clock reads what `clock` says.
+fn hook_while_ticks_pass(ticks: u32, clock: fn() -> Option<Duration>) -> (WasmMod, Option<i64>) {
+    let id = crate::boundary::import_id("StructureRandom", "next_long").unwrap();
+    let module = module(&format!(
+        "i32.const {id} i32.const 0 i32.const 0 i32.const 2048 i32.const 8 call $host drop (block (loop (br 1))) i64.const 8796093022216"
+    ));
+    // The loop's header is where the guest checks its epoch deadline after the host call.
+    let epoch = {
+        let mut group = module.running.group.lock().unwrap();
+        group.store.data_mut().cpu_clock = clock;
+        group.store.engine().clone()
+    };
+    let mut random = Random(|| {
+        for _ in 0..ticks {
+            epoch.increment_epoch();
+        }
+        7
+    });
+    let mut frame = Frame::default();
+    frame.set_structure_random_mut(&mut random);
+    let answer = module.call(CallClass::Hook, frame, 0, None, |_| {}, |r| r.take::<i64>());
+    (module, answer)
+}
+
+thread_local! {
+    /// The CPU time [`stepping_clock`] reads next, in ms.
+    static CPU_MS: Cell<u64> = const { Cell::new(0) };
+}
+/// A thread clock that moves 110 ms on at each read.
+fn stepping_clock() -> Option<Duration> {
+    CPU_MS.with(|ms| {
+        ms.set(ms.get() + 110);
+        Some(Duration::from_millis(ms.get()))
+    })
+}
+
+#[test]
+fn a_hook_the_system_left_waiting_runs_on_within_its_cpu_budget() {
+    crate::test_stack::on_guest_stack(|| {
+        // 1000 ticks of wall time, ten times the budget, and no CPU time spent: the call ends
+        // normally and the group keeps running.
+        let (module, answer) = hook_while_ticks_pass(1000, || Some(Duration::ZERO));
+        assert!(answer.is_some(), "{}", take_refusal());
+        assert!(!module.is_stopped());
+    })
+}
+
+#[test]
+fn a_hook_past_its_cpu_budget_stops_the_group_and_says_so() {
+    crate::test_stack::on_guest_stack(|| {
+        // The call starts at 110 ms of thread CPU time and the deadline reads 220: 110 ms used,
+        // past the 100 ms budget.
+        CPU_MS.with(|ms| ms.set(0));
+        let (module, answer) = hook_while_ticks_pass(1000, stepping_clock);
+        assert_eq!(answer, None);
+        assert!(module.is_stopped());
+        assert_eq!(
+            take_refusal(),
+            "epoch deadline: the call used 110 ms of CPU time, past its budget of 100 ms"
+        );
+    })
+}
+
+#[test]
+fn without_a_thread_clock_the_ticks_are_the_budget() {
+    crate::test_stack::on_guest_stack(|| {
+        let (module, answer) = hook_while_ticks_pass(1000, || None);
+        assert_eq!(answer, None);
+        assert!(module.is_stopped());
+        assert_eq!(
+            take_refusal(),
+            "epoch deadline: the call ran past its budget of 100 ticks (about 100 ms)"
+        );
+        // Under the budget it ends normally.
+        let (module, answer) = hook_while_ticks_pass(50, || None);
+        assert!(answer.is_some());
+        assert!(!module.is_stopped());
+    })
+}
+
+#[test]
+fn this_threads_cpu_clock_counts_its_own_work() {
+    let Some(start) = thread_cpu_time() else {
+        return; // A platform without a thread clock: the budget counts wall time.
+    };
+    // Sleeping takes no CPU time; spinning does.
+    std::thread::sleep(Duration::from_millis(50));
+    let slept = thread_cpu_time().unwrap() - start;
+    let spin = Instant::now();
+    while spin.elapsed() < Duration::from_millis(30) {
+        std::hint::black_box(0u64);
+    }
+    let spun = thread_cpu_time().unwrap() - start - slept;
+    assert!(
+        slept < Duration::from_millis(25),
+        "{slept:?} of CPU while asleep"
+    );
+    assert!(
+        spun > Duration::from_millis(5),
+        "{spun:?} of CPU while spinning"
+    );
 }
 
 #[test]
@@ -2031,14 +2140,44 @@ fn a_guest_call_that_answers_nothing_names_why() {
         fault_reason(
             &wasmtime::Error::new(wasmtime::Trap::Interrupt),
             100,
+            None,
             &mut Limits::new("a+b".into(), 64)
         ),
         "epoch deadline: the call ran past its budget of 100 ticks (about 100 ms)"
     );
     assert_eq!(
         fault_reason(
+            &wasmtime::Error::new(wasmtime::Trap::Interrupt),
+            100,
+            Some(Overrun::Cpu(Duration::from_millis(104))),
+            &mut Limits::new("a+b".into(), 64)
+        ),
+        "epoch deadline: the call used 104 ms of CPU time, past its budget of 100 ms"
+    );
+    assert_eq!(
+        fault_reason(
+            &wasmtime::Error::new(wasmtime::Trap::Interrupt),
+            100,
+            Some(Overrun::Wall(Duration::from_millis(5003))),
+            &mut Limits::new("a+b".into(), 64)
+        ),
+        "epoch deadline: the call ran 5003 ms of wall time, past its limit of 5000 ms, using \
+         less CPU time than its budget of 100 ms (waiting in host calls, or not run)"
+    );
+    // A hook may wait 5 s; a load call four times its 30 s budget.
+    assert_eq!(
+        wall_backstop(Duration::from_millis(100)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        wall_backstop(Duration::from_secs(30)),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        fault_reason(
             &wasmtime::Error::new(wasmtime::Trap::StackOverflow),
             100,
+            None,
             &mut Limits::new("a+b".into(), 64)
         ),
         "wasm trap: call stack exhausted"
@@ -2052,6 +2191,7 @@ fn a_guest_call_that_answers_nothing_names_why() {
         fault_reason(
             &wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
             100,
+            None,
             &mut limits
         ),
         "wasm trap: wasm `unreachable` instruction executed, after memory.grow to 65 MiB was refused at group a+b's limit of 64 MiB"
@@ -2060,6 +2200,7 @@ fn a_guest_call_that_answers_nothing_names_why() {
         fault_reason(
             &wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
             100,
+            None,
             &mut limits
         ),
         "wasm trap: wasm `unreachable` instruction executed"
@@ -2078,6 +2219,7 @@ fn a_guest_call_that_answers_nothing_names_why() {
         fault_reason(
             &wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
             100,
+            None,
             &mut limits
         ),
         "wasm trap: wasm `unreachable` instruction executed, after memory.grow to 48 MiB was refused by the system below group a+b's limit of 64 MiB"

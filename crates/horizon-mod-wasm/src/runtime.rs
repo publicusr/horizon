@@ -124,8 +124,86 @@ pub(crate) struct State {
     path: Vec<(Arc<str>, u32)>,
     refusals: std::collections::HashSet<String>,
     epoch_budget: u64,
+    /// The running top-level call's start, for [`State::budget_left`]; `None` outside one (loading).
+    call_start: Option<CallStart>,
+    /// Why the last call was stopped at its deadline, for [`fault_reason`].
+    overrun: Option<Overrun>,
+    /// The calling thread's CPU time; tests stand in for it.
+    cpu_clock: fn() -> Option<Duration>,
     group: usize,
     lending: Arc<AtomicUsize>,
+}
+
+/// Where and when a top-level guest call began.
+#[derive(Clone, Copy, Debug)]
+struct CallStart {
+    thread: std::thread::ThreadId,
+    /// The thread's CPU time then; `None` where the platform has no thread clock.
+    cpu: Option<Duration>,
+    wall: Instant,
+}
+
+/// Why a call was stopped at its epoch deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Overrun {
+    /// The call's thread spent more CPU time in it than its budget.
+    Cpu(Duration),
+    /// Wall time passed [`wall_backstop`] while the thread used little CPU: a guest waiting in
+    /// host calls, or a thread the system never ran.
+    Wall(Duration),
+}
+
+/// How long a call may run in wall time while its thread stays under its CPU budget: a guest that
+/// waits in blocking host calls uses little CPU, and still has to end.
+pub(crate) fn wall_backstop(budget: Duration) -> Duration {
+    (budget * 4).max(Duration::from_secs(5))
+}
+
+/// The calling thread's CPU time (user and system), or `None` where it can't be read: the budget
+/// then counts wall time, as the epoch ticker does.
+pub(crate) fn thread_cpu_time() -> Option<Duration> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        Some(Duration::new(
+            u64::try_from(t.tv_sec).ok()?,
+            u32::try_from(t.tv_nsec).ok()?,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentThread, GetThreadTimes},
+        };
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: the current thread's pseudo-handle and four live FILETIMEs to write.
+        let ok = unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        // FILETIME counts 100 ns.
+        (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)).saturating_mul(100)))
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    {
+        None
+    }
 }
 // SAFETY: frames contain borrowed native objects only while the group mutex is held.
 // They are pushed and popped synchronously on that thread; callbacks borrow the same
@@ -146,9 +224,41 @@ impl State {
             path: Vec::with_capacity(64),
             refusals: Default::default(),
             epoch_budget: 0,
+            call_start: None,
+            overrun: None,
+            cpu_clock: thread_cpu_time,
             group: 0,
             lending: Arc::default(),
         }
+    }
+
+    /// At the epoch deadline of a top-level call: the ticks it may run on while its thread has
+    /// spent less CPU time in it than its budget (the ticker counts wall time, which also runs
+    /// while the system leaves the thread waiting), or `None` to stop it, with why in
+    /// `overrun`. Outside a top-level call, on another thread or with no thread clock, the
+    /// deadline stops it as the ticker counted.
+    fn budget_left(&mut self) -> Option<u64> {
+        let start = self.call_start?;
+        if start.thread != std::thread::current().id() {
+            return None;
+        }
+        let budget = Duration::from_millis(self.epoch_budget);
+        let wall = start.wall.elapsed();
+        if wall >= wall_backstop(budget) {
+            self.overrun = Some(Overrun::Wall(wall));
+            return None;
+        }
+        let used = (self.cpu_clock)()?.saturating_sub(start.cpu?);
+        if used >= budget {
+            self.overrun = Some(Overrun::Cpu(used));
+            return None;
+        }
+        // Whole ticks still left, at least one, so the next check comes after the next tick.
+        Some(
+            u64::try_from((budget - used).as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        )
     }
 }
 
@@ -332,13 +442,28 @@ pub(crate) fn take_refusal() -> String {
         .with(|last| last.borrow_mut().take())
         .unwrap_or_else(|| "refused".into())
 }
-fn fault_reason(error: &wasmtime::Error, budget: u64, limits: &mut Limits) -> String {
+fn fault_reason(
+    error: &wasmtime::Error,
+    budget: u64,
+    overrun: Option<Overrun>,
+    limits: &mut Limits,
+) -> String {
     let reason = match error.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::Interrupt) => {
-            format!(
+        Some(wasmtime::Trap::Interrupt) => match overrun {
+            Some(Overrun::Cpu(used)) => format!(
+                "epoch deadline: the call used {} ms of CPU time, past its budget of {budget} ms",
+                used.as_millis()
+            ),
+            Some(Overrun::Wall(wall)) => format!(
+                "epoch deadline: the call ran {} ms of wall time, past its limit of {} ms, using \
+                 less CPU time than its budget of {budget} ms (waiting in host calls, or not run)",
+                wall.as_millis(),
+                wall_backstop(Duration::from_millis(budget)).as_millis()
+            ),
+            None => format!(
                 "epoch deadline: the call ran past its budget of {budget} ticks (about {budget} ms)"
-            )
-        }
+            ),
+        },
         Some(trap) => format!("{trap}"),
         None => format!("fault: {error:#}"),
     };
@@ -949,6 +1074,11 @@ impl WasmMod {
         let limits = Limits::new(group.join("+").into(), memory_mib);
         let mut store = Store::new(engine, State::new(limits));
         store.limiter(|state| &mut state.limits);
+        // The ticker counts wall time; a top-level call's budget is its thread's CPU time.
+        store.epoch_deadline_callback(|mut cx| match cx.data_mut().budget_left() {
+            Some(ticks) => Ok(wasmtime::UpdateDeadline::Continue(ticks)),
+            None => Err(wasmtime::Trap::Interrupt.into()),
+        });
         store.set_epoch_deadline(horizon_mod_runtime::MAX_GUEST_CALL_BUDGET_MILLIS);
         let mut armed = false;
         // Each API call is its own import, linked by name: what the group imports, and the
@@ -1218,7 +1348,14 @@ impl WasmMod {
                     }
                 };
                 store.set_epoch_deadline(budget);
-                store.data_mut().epoch_budget = budget;
+                let state = store.data_mut();
+                state.epoch_budget = budget;
+                state.overrun = None;
+                state.call_start = Some(CallStart {
+                    thread: std::thread::current().id(),
+                    cpu: (state.cpu_clock)(),
+                    wall: Instant::now(),
+                });
                 store.as_context_mut()
             }
         };
@@ -1322,7 +1459,11 @@ impl WasmMod {
             result
         };
         let fault = match &result {
-            Err(CallError::Fault(e)) => Some(fault_reason(e, budget, &mut store.data_mut().limits)),
+            Err(CallError::Fault(e)) => {
+                let state = store.data_mut();
+                let overrun = state.overrun.take();
+                Some(fault_reason(e, budget, overrun, &mut state.limits))
+            }
             // A top-level call that ended without a fault handled any refused growth itself: a
             // later, unrelated fault must not be blamed on it.
             _ if depth == 1 => {
