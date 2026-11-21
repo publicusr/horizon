@@ -104,8 +104,12 @@ pub struct IngressLease {
 }
 pub(super) const PAYLOAD_DEADLINE: Duration =
     Duration::from_millis(2 * horizon_mod_runtime::MAX_GUEST_CALL_BUDGET_MILLIS);
+// A call that waits under its CPU budget runs up to its wall backstop: a payload queued behind
+// the longest of them must still be alive when the group gets to it.
+const _: () =
+    assert!(PAYLOAD_DEADLINE.as_millis() > horizon_mod_runtime::MAX_GUEST_CALL_WALL_MILLIS as u128);
 impl IngressLease {
-    /// A retained payload may wait longer than the VM's largest (30 s) load call,
+    /// A retained payload may wait longer than the VM's longest call (45 s of wall time),
     /// but never extend its deadline by moving between receiving queues.
     pub(super) fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.received) >= PAYLOAD_DEADLINE

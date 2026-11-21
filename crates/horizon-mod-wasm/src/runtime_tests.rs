@@ -1133,6 +1133,35 @@ fn without_a_thread_clock_the_ticks_are_the_budget() {
 }
 
 #[test]
+fn a_call_under_its_cpu_budget_is_checked_again_by_its_wall_backstop() {
+    // A load call (30 s of CPU, 45 s of wall) 20 ms short of its backstop and with almost no CPU
+    // used: it may run on to the backstop, not for the 30 s of CPU it has left.
+    let Some(began) =
+        Instant::now().checked_sub(Duration::from_secs(45) - Duration::from_millis(20))
+    else {
+        return; // The machine has been up for less than 45 s.
+    };
+    let mut state = State::new(Limits::new("a".into(), 64));
+    state.epoch_budget = horizon_mod_runtime::MAX_GUEST_CALL_BUDGET_MILLIS;
+    state.cpu_clock = || Some(Duration::from_millis(1));
+    state.call_start = Some(CallStart {
+        thread: std::thread::current().id(),
+        cpu: Some(Duration::ZERO),
+        wall: began,
+    });
+    let ticks = state.budget_left().expect("still under both limits");
+    assert!((1..=20).contains(&ticks), "{ticks} ticks");
+    // A fresh hook call gets the CPU time it has left.
+    state.epoch_budget = 100;
+    state.call_start = Some(CallStart {
+        thread: std::thread::current().id(),
+        cpu: Some(Duration::ZERO),
+        wall: Instant::now(),
+    });
+    assert_eq!(state.budget_left(), Some(99));
+}
+
+#[test]
 fn this_threads_cpu_clock_counts_its_own_work() {
     let Some(start) = thread_cpu_time() else {
         return; // A platform without a thread clock: the budget counts wall time.
@@ -1140,18 +1169,23 @@ fn this_threads_cpu_clock_counts_its_own_work() {
     // Sleeping takes no CPU time; spinning does.
     std::thread::sleep(Duration::from_millis(50));
     let slept = thread_cpu_time().unwrap() - start;
+    // Spin until the clock has seen 10 ms of work; a thread the system leaves waiting takes
+    // longer, and the wall limit only keeps a clock that never moves from hanging the test.
     let spin = Instant::now();
-    while spin.elapsed() < Duration::from_millis(30) {
+    let spun = loop {
         std::hint::black_box(0u64);
-    }
-    let spun = thread_cpu_time().unwrap() - start - slept;
+        let spun = thread_cpu_time().unwrap() - start - slept;
+        if spun >= Duration::from_millis(10) || spin.elapsed() > Duration::from_secs(10) {
+            break spun;
+        }
+    };
     assert!(
         slept < Duration::from_millis(25),
         "{slept:?} of CPU while asleep"
     );
     assert!(
-        spun > Duration::from_millis(5),
-        "{spun:?} of CPU while spinning"
+        spun >= Duration::from_millis(10),
+        "{spun:?} of CPU in 10 s of spinning"
     );
 }
 
@@ -2164,14 +2198,19 @@ fn a_guest_call_that_answers_nothing_names_why() {
         "epoch deadline: the call ran 5003 ms of wall time, past its limit of 5000 ms, using \
          less CPU time than its budget of 100 ms (waiting in host calls, or not run)"
     );
-    // A hook may wait 5 s; a load call four times its 30 s budget.
+    // A hook may wait 5 s; a load call four times its 30 s budget, up to the 45 s every queued
+    // payload outlives.
     assert_eq!(
         wall_backstop(Duration::from_millis(100)),
         Duration::from_secs(5)
     );
     assert_eq!(
+        wall_backstop(Duration::from_secs(10)),
+        Duration::from_secs(40)
+    );
+    assert_eq!(
         wall_backstop(Duration::from_secs(30)),
-        Duration::from_secs(120)
+        Duration::from_secs(45)
     );
     assert_eq!(
         fault_reason(

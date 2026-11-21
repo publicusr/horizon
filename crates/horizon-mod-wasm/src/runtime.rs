@@ -154,9 +154,15 @@ pub(crate) enum Overrun {
 }
 
 /// How long a call may run in wall time while its thread stays under its CPU budget: a guest that
-/// waits in blocking host calls uses little CPU, and still has to end.
+/// waits in blocking host calls uses little CPU, and still has to end. Never past
+/// [`horizon_mod_runtime::MAX_GUEST_CALL_WALL_MILLIS`] (queued payloads outlive it), never under
+/// the budget itself.
 pub(crate) fn wall_backstop(budget: Duration) -> Duration {
-    (budget * 4).max(Duration::from_secs(5))
+    let most = Duration::from_millis(horizon_mod_runtime::MAX_GUEST_CALL_WALL_MILLIS);
+    (budget * 4)
+        .max(Duration::from_secs(5))
+        .min(most)
+        .max(budget)
 }
 
 /// The calling thread's CPU time (user and system), or `None` where it can't be read: the budget
@@ -244,7 +250,8 @@ impl State {
         }
         let budget = Duration::from_millis(self.epoch_budget);
         let wall = start.wall.elapsed();
-        if wall >= wall_backstop(budget) {
+        let backstop = wall_backstop(budget);
+        if wall >= backstop {
             self.overrun = Some(Overrun::Wall(wall));
             return None;
         }
@@ -253,12 +260,10 @@ impl State {
             self.overrun = Some(Overrun::Cpu(used));
             return None;
         }
-        // Whole ticks still left, at least one, so the next check comes after the next tick.
-        Some(
-            u64::try_from((budget - used).as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1),
-        )
+        // Whole ticks still left, at least one, so the next check comes after the next tick; never
+        // past the backstop, since the ticks are the only check there is.
+        let left = (budget - used).min(backstop - wall);
+        Some(u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1))
     }
 }
 
